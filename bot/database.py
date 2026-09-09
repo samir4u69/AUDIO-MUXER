@@ -28,6 +28,28 @@ ROLE_USER = "user"
 _OP_TIMEOUT = 3  # seconds
 
 
+def install_asyncio_filter(loop) -> None:
+    """Suppress 'Future exception was never retrieved' noise from MongoDB.
+
+    When Mongo is down, pymongo runs each op in an executor thread; the
+    operation fails after our short timeout already returned a fallback, and
+    the orphaned future would otherwise dump a full traceback per DB call.
+    Real (non-Mongo) errors are still reported.
+    """
+    previous = loop.get_exception_handler()
+
+    def handler(loop, context):
+        exc = context.get("exception")
+        if exc is not None and type(exc).__name__ == "ServerSelectionTimeoutError":
+            return  # Mongo down; already handled via fallback
+        if previous:
+            previous(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+
+
 def _now():
     return datetime.now(timezone.utc)
 
@@ -57,6 +79,9 @@ class Database:
     _DOWN_RETRY_AFTER = 30.0  # seconds
 
     async def _run(self, coro, fallback=None):
+        """Run a Mongo op with a short timeout; degrade to a fallback if Mongo
+        is down. A circuit breaker skips Mongo while it is down and retries
+        after a cooldown."""
         import time
         if self._down_since is not None:
             if time.monotonic() - self._down_since < self._DOWN_RETRY_AFTER:
