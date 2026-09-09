@@ -60,6 +60,15 @@ async def run_ffmpeg(args, total_duration=None, on_progress=None, timeout=None) 
         proc.kill()
         await proc.wait()
         raise FFmpegError(cmd, -9, "ffmpeg timed out")
+    except asyncio.CancelledError:
+        # Task was cancelled (user pressed Cancel): kill ffmpeg so it doesn't
+        # keep running in the background, then propagate.
+        proc.kill()
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        raise
     stderr = b"".join(chunks).decode("utf-8", "replace")
     if proc.returncode != 0:
         raise FFmpegError(cmd, proc.returncode, stderr)

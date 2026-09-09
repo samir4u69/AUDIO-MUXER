@@ -38,6 +38,9 @@ trimmer = Trimmer()
 detector = SyncDetector()
 _queue_sem = asyncio.Semaphore(config.MAX_CONCURRENT_JOBS)
 
+# Running job tasks by job_id, so they can be cancelled by the user.
+_running_jobs: dict[str, asyncio.Task] = {}
+
 app = Client(
     "audiomuxer",
     api_id=config.API_ID,
@@ -59,22 +62,30 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
      InlineKeyboardButton("🔁 Convert", callback_data="op:convert")],
 ])
 
-# After the user sends the audio for "Add", choose how to align it.
-ADD_SYNC_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🔍 Auto Sync", callback_data="addsync:auto"),
-     InlineKeyboardButton("➕ Just Add (no sync)", callback_data="addsync:none")],
-])
+# Alignment + language choices are token-scoped so a button press is tied to
+# the exact audio file it was shown for (prevents stale "audio missing" taps).
+def _add_sync_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 Auto Sync", callback_data=f"addsync:auto:{token}"),
+         InlineKeyboardButton("➕ Just Add", callback_data=f"addsync:none:{token}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"flow:cancel:{token}")],
+    ])
 
-# Language picker for the added track.
-def _language_keyboard() -> InlineKeyboardMarkup:
+
+def _language_keyboard(token: str) -> InlineKeyboardMarkup:
     langs = ["English", "Hindi", "Japanese", "Spanish", "French", "German",
              "Korean", "Chinese", "Arabic", "Russian", "Tamil", "Telugu"]
-    rows = [[InlineKeyboardButton(l, callback_data=f"lang:{l.lower()}")
+    rows = [[InlineKeyboardButton(l, callback_data=f"lang:{l.lower()}:{token}")
              for l in langs[i:i + 3]] for i in range(0, len(langs), 3)]
-    rows.append([InlineKeyboardButton("🚫 No language tag", callback_data="lang:none")])
+    rows.append([InlineKeyboardButton("🚫 No language tag", callback_data=f"lang:none:{token}")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"flow:cancel:{token}")])
     return InlineKeyboardMarkup(rows)
 
-LANGUAGE_KEYBOARD = _language_keyboard()
+
+def _cancel_kb(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancel task", callback_data=f"cancel:{job_id}")]]
+    )
 
 PARAM_PROMPTS = {
     "extract": "Which audio format? Reply with mp3, aac, wav, flac, ogg or opus.",
@@ -281,7 +292,8 @@ async def cmd_help(client, msg: Message):
         "**User commands**\n"
         "/start — welcome\n"
         "/help — this message\n"
-        "/myjobs — your recent jobs\n\n"
+        "/myjobs — your recent jobs\n"
+        "/cancel <job_id> — cancel a running task\n\n"
         "Send any video/audio file to get the action menu.\n\n"
         "**Admin commands**\n"
         "/stats — bot statistics\n"
@@ -304,6 +316,29 @@ async def cmd_myjobs(client, msg: Message):
     lines = [f"`{j['_id']}` {j['operation']} — {j['status']} ({j.get('progress', 0)}%)"
              for j in jobs]
     await msg.reply_text("**Your recent jobs:**\n" + "\n".join(lines))
+
+
+@app.on_message(filters.command("cancel"))
+async def cmd_cancel(client, msg: Message):
+    """Cancel a running task: /cancel <job_id> (or the in-message button)."""
+    user_id = msg.from_user.id
+    if len(msg.command) < 2:
+        mine = [jid for jid, t in _running_jobs.items() if not t.done()]
+        if not mine:
+            await msg.reply_text("No running tasks. Each task message has a ❌ Cancel button.")
+            return
+        await msg.reply_text(
+            "Usage: `/cancel <job_id>`\nRunning task IDs:\n" +
+            "\n".join(f"`{j}`" for j in mine)
+        )
+        return
+    job_id = msg.command[1].strip()
+    task = _running_jobs.get(job_id)
+    if task and not task.done():
+        task.cancel()
+        await msg.reply_text(f"🚫 Cancelling `{job_id}`…")
+    else:
+        await msg.reply_text(f"No running task `{job_id}`.")
 
 
 @app.on_message(filters.command("stats"))
@@ -490,13 +525,17 @@ async def _handle_audio_input(msg, status, user_id, state, audio: Path):
             )
             return
         if op == "add":
-            # Stash the audio and ask how to align it (auto-sync or none),
-            # then pick a language. The actual mux happens in the callbacks.
+            # Stash the audio + a fresh flow token, then ask how to align it.
+            # The token ties the alignment/language buttons to THIS audio so a
+            # later tap on a stale button can't misfire with "audio missing".
+            token = uuid.uuid4().hex[:8]
             state["pending_audio"] = str(audio)
+            state["add_token"] = token
+            state.pop("pending_op", None)
             await db.set_session(user_id, state)
             await status.edit_text(
                 "🎵 Got the audio. How should I align it with the video?",
-                reply_markup=ADD_SYNC_KEYBOARD,
+                reply_markup=_add_sync_keyboard(token),
             )
             return
         if op == "replace":
@@ -535,18 +574,13 @@ async def _handle_audio_input(msg, status, user_id, state, audio: Path):
             await db.set_session(user_id, state)
 
 
-async def _do_add(query, user_id, state, language: str | None,
-                  auto_sync: bool, offset_ms: int = 0):
+async def _do_add(message, user_id: int, video: str, audio: str,
+                  language: str | None, offset_ms: int = 0):
     """Run the add-track job with the chosen language and sync offset."""
-    video = state["file"]
-    audio = state.get("pending_audio")
-    if not audio:
-        await query.message.edit_text("⚠️ Audio file missing — send it again.")
-        return
     kwargs = {"audio_offset_ms": offset_ms}
     if language:
         kwargs["language"] = language
-    await _run_job(query.message, user_id, "add track",
+    await _run_job(message, user_id, "add track",
                    muxer.add_audio_track, video, audio, **kwargs)
 
 
@@ -557,31 +591,67 @@ async def _do_add(query, user_id, state, language: str | None,
 async def on_button(client, query: CallbackQuery):
     user_id = query.from_user.id
     state = await db.get_session(user_id)
-    data = query.data
+    data = query.data or ""
+
+    # --- Cancel a running task ---
+    if data.startswith("cancel:"):
+        job_id = data.split(":", 1)[1]
+        task = _running_jobs.get(job_id)
+        if task and not task.done():
+            task.cancel()
+            await query.answer("🚫 Cancelling…")
+        else:
+            await query.answer("That task already finished.", show_alert=True)
+        return
+
+    # --- Cancel the add-audio flow (before it starts) ---
+    if data.startswith("flow:cancel"):
+        token = data.split(":", 2)[2] if data.count(":") >= 2 else None
+        if token is not None and state.get("add_token") != token:
+            await query.answer("This dialog expired.", show_alert=True)
+            return
+        for k in ("pending_audio", "add_token", "add_auto_sync"):
+            state.pop(k, None)
+        await db.set_session(user_id, state)
+        await query.message.edit_text("❌ Add-audio cancelled.")
+        await query.answer()
+        return
 
     # --- Add-audio flow: alignment choice, then language, then run ---
     if data.startswith("addsync:"):
+        parts = data.split(":")          # addsync : auto|none : token
+        token = parts[2] if len(parts) > 2 else None
         if not state.get("file") or not state.get("pending_audio"):
-            await query.answer("Session expired — start over.", show_alert=True)
+            await query.answer("Session expired — send the audio again.", show_alert=True)
             return
-        state["add_auto_sync"] = data == "addsync:auto"
+        if token != state.get("add_token"):
+            await query.answer("That audio changed — use the latest dialog.", show_alert=True)
+            return
+        state["add_auto_sync"] = parts[1] == "auto"
         await db.set_session(user_id, state)
         await query.message.edit_text(
             "🌐 Pick a language for the new audio track:",
-            reply_markup=LANGUAGE_KEYBOARD,
+            reply_markup=_language_keyboard(token),
         )
         await query.answer()
         return
 
     if data.startswith("lang:"):
+        parts = data.split(":")          # lang : name|none : token
+        token = parts[2] if len(parts) > 2 else None
         if not state.get("file") or not state.get("pending_audio"):
-            await query.answer("Session expired — start over.", show_alert=True)
+            await query.answer("Session expired — send the audio again.", show_alert=True)
             return
-        language = None if data == "lang:none" else data.split(":", 1)[1]
-        auto_sync = state.pop("add_auto_sync", False)
+        if token != state.get("add_token"):
+            await query.answer("That audio changed — use the latest dialog.", show_alert=True)
+            return
+        language = None if parts[1] == "none" else parts[1]
+        auto_sync = state.get("add_auto_sync", False)
         video = state["file"]
-        audio = state.pop("pending_audio")
-        state.pop("pending_op", None)
+        audio = state["pending_audio"]
+        # Clear the flow state now that we have everything we need.
+        for k in ("pending_audio", "add_token", "add_auto_sync", "pending_op"):
+            state.pop(k, None)
         await db.set_session(user_id, state)
         await query.answer()
 
@@ -591,15 +661,17 @@ async def on_button(client, query: CallbackQuery):
             try:
                 result = await detector.detect(video, audio)
             except SyncDetectionError as exc:
-                await query.message.edit_text(f"⚠️ Sync detection failed: {exc}. Adding without offset.")
+                await query.message.edit_text(
+                    f"⚠️ Sync detection failed: {exc}. Adding without offset.")
                 result = None
             if result is not None:
                 if result.reliable and abs(result.offset_ms) >= 1:
                     offset_ms = -int(round(result.offset_ms))
-                    await query.message.edit_text(f"🔍 {result.summary()}\nApplying and adding track…")
+                    await query.message.edit_text(
+                        f"🔍 {result.summary()}\nApplying and adding track…")
                 else:
                     await query.message.edit_text("✅ Audio already aligned. Adding track…")
-        await _do_add(query, user_id, state, language, auto_sync, offset_ms)
+        await _do_add(query.message, user_id, video, audio, language, offset_ms)
         return
 
     action = data.split(":", 1)[1] if ":" in data else data
@@ -691,6 +763,7 @@ async def handle_text(client, msg: Message):
         state.pop("sync_audio", None)
         state.pop("pending_audio", None)
         state.pop("add_auto_sync", None)
+        state.pop("add_token", None)
         await db.set_session(user_id, state)
 
 
@@ -700,11 +773,14 @@ async def handle_text(client, msg: Message):
 async def _run_job(msg, user_id: int, name: str, func, *args, **kwargs):
     job_id = uuid.uuid4().hex[:12]
     await db.create_job(job_id, user_id, name, [str(a) for a in args[:1]])
-    status = await msg.reply_text(f"🔄 {name}: queued…")
-    prog = Progress(status, f"⚙️ **{name}**")
+    status = await msg.reply_text(
+        f"🔄 {name} queued…\n🆔 `{job_id}`", reply_markup=_cancel_kb(job_id)
+    )
+    prog = Progress(status, f"⚙️ **{name}**  🆔 `{job_id}`")
 
     async with _queue_sem:
         await db.update_job(job_id, status="running")
+        _running_jobs[job_id] = asyncio.current_task()
         poller = asyncio.ensure_future(prog.run())
         try:
             out = await func(*args, on_progress=prog.update_percent, **kwargs)
@@ -714,8 +790,15 @@ async def _run_job(msg, user_id: int, name: str, func, *args, **kwargs):
             if isinstance(out, Path):
                 await _send_result(msg, out, status)
             else:
-                await prog.finish(f"✅ {name} finished!")
+                await prog.finish(f"✅ {name} finished!  🆔 `{job_id}`")
+        except asyncio.CancelledError:
+            poller.cancel()
+            await db.update_job(job_id, status="cancelled", error="cancelled by user")
+            await prog.finish(f"🚫 {name} cancelled.  🆔 `{job_id}`")
+            raise
         except Exception as exc:
             poller.cancel()
             await db.update_job(job_id, status="failed", error=str(exc))
-            await prog.finish(f"❌ {name} failed: {exc}")
+            await prog.finish(f"❌ {name} failed: {exc}\n🆔 `{job_id}`")
+        finally:
+            _running_jobs.pop(job_id, None)
