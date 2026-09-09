@@ -376,7 +376,7 @@ async def on_button(client, query: CallbackQuery):
 # ---------------------------------------------------------------------------
 # Text parameters
 # ---------------------------------------------------------------------------
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "help"]))
+@app.on_message(filters.text & filters.private & ~filters.regex(r"^/"))
 async def handle_text(client, msg: Message):
     user_id = msg.from_user.id
     state = await db.get_session(user_id)

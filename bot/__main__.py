@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from pathlib import Path
 
 from bot import config
 from bot.ffmpeg_wrapper import check_ffmpeg
@@ -47,16 +46,24 @@ def main() -> None:
 
     from bot.handlers import app, db  # noqa: WPS433 (imports register handlers)
 
-    async def startup():
-        if await db.ping():
+    async def _run() -> None:
+        await app.start()
+        mongo_ok = await db.ping()
+        if mongo_ok:
             log.info("MongoDB connected (%s)", config.MONGO_DB)
         else:
-            log.warning("MongoDB not reachable — sessions/roles will not persist")
+            log.warning("MongoDB not reachable — running without persistence")
         asyncio.create_task(_janitor())
-        log.info("Bot starting (owner=%s, admins=%s)", config.OWNER_ID, config.ADMIN_IDS)
+        log.info("Bot started (owner=%s, admins=%s). Press Ctrl+C to stop.",
+                 config.OWNER_ID, config.ADMIN_IDS)
+        await _idle()
+        await app.stop()
 
-    app.startup_tasks = [startup()]  # run before polling
-    app.run()
+    async def _idle() -> None:
+        from pyrogram import idle
+        await idle()
+
+    app.loop.run_until_complete(_run())
 
 
 if __name__ == "__main__":
