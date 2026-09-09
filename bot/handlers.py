@@ -45,6 +45,28 @@ app = Client(
     in_memory=True,
 )
 
+# The asyncio loop the bot runs on. Captured lazily on first use so that the
+# pyrogram progress callbacks (which run in executor threads) can schedule
+# message edits back onto it via run_coroutine_threadsafe.
+_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def set_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Record the bot's running loop (called once at startup)."""
+    global _LOOP
+    _LOOP = loop
+
+
+def _loop() -> asyncio.AbstractEventLoop:
+    global _LOOP
+    try:
+        _LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    if _LOOP is None:
+        _LOOP = app.loop
+    return _LOOP
+
 MAIN_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎵 Extract Audio", callback_data="op:extract"),
      InlineKeyboardButton("➕ Add Audio", callback_data="op:add")],
@@ -109,27 +131,46 @@ class Progress:
         self.total = total or 0
         self.started = time.monotonic()
         self._last_edit = 0.0
-        self._pending: asyncio.Task | None = None
+        self._last_text = ""
+        self._pending = None  # asyncio.Task or concurrent Future
+        self._editable = hasattr(status, "edit_text")
 
-    # -- transfer-style update (pyrogram download/upload callback) --
+    # -- transfer-style update (pyrogram download/upload callback).
+    # NOTE: pyrogram invokes this from an executor thread, so all edits must
+    # be scheduled thread-safely onto the bot's event loop.
     def update(self, current: int, total: int | None = None):
         if total:
             self.total = total
         pct = (current / self.total * 100) if self.total else 0.0
-        self._maybe_edit(pct, current)
+        self._schedule(pct, current)
 
-    # -- percent-style update (ffmpeg on_progress callback) --
+    # -- percent-style update (ffmpeg on_progress callback, runs on the loop) --
     def update_percent(self, pct: float):
-        self._maybe_edit(float(pct), None)
+        self._schedule(float(pct), None)
 
-    def _maybe_edit(self, pct: float, current: int | None):
+    def _schedule(self, pct: float, current: int | None):
+        if not self._editable:
+            return
         now = time.monotonic()
         if pct < 100 and now - self._last_edit < config.PROGRESS_UPDATE_INTERVAL:
             return
         self._last_edit = now
         text = self._render(pct, current)
-        if self._pending is None or self._pending.done():
-            self._pending = asyncio.ensure_future(self._safe_edit(text))
+        if text == self._last_text:
+            return
+        self._last_text = text
+        if self._pending is not None and not self._pending.done():
+            return  # an edit is already in flight; skip to avoid flooding
+        coro = self._safe_edit(text)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None and running is _loop():
+            self._pending = running.create_task(coro)
+        else:
+            # Called from a worker thread: hop to the bot loop.
+            self._pending = asyncio.run_coroutine_threadsafe(coro, _loop())
 
     def _render(self, pct: float, current: int | None) -> str:
         elapsed = max(time.monotonic() - self.started, 1e-3)
@@ -149,12 +190,18 @@ class Progress:
             pass  # message deleted / not modified / flood — ignore
 
     async def finish(self, text: str):
-        if self._pending is not None:
+        self._last_text = ""  # force the final edit through
+        pending, self._pending = self._pending, None
+        if pending is not None:
             try:
-                await self._pending
+                if isinstance(pending, asyncio.Future):
+                    await pending
+                else:  # concurrent.futures.Future
+                    await asyncio.wrap_future(pending)
             except Exception:
                 pass
-        await self._safe_edit(text)
+        if self._editable:
+            await self._safe_edit(text)
 
 
 async def _role(user_id: int) -> str:
@@ -305,7 +352,7 @@ async def cmd_logs(client, msg: Message):
         return
     tail = config.WORK_DIR / f"logs_tail_{n}.txt"
     tail.write_text(text)
-    await _send_result(msg, tail, caption=f"📜 Last {len(lines)} log lines")
+    await _send_result(msg, tail, status=None, caption=f"📜 Last {len(lines)} log lines")
     tail.unlink(missing_ok=True)
 
 
@@ -434,6 +481,16 @@ async def _handle_audio_input(msg, status, user_id, state, audio: Path):
     video = state["file"]
     op = state["pending_op"]
     try:
+        # Validate the audio is actually readable before starting ffmpeg, so a
+        # corrupt/mislabelled file gives a clear message instead of an ffmpeg dump.
+        ainfo = await inspect(audio)
+        if not ainfo.audio_tracks:
+            await status.edit_text(
+                "❌ That file has no readable audio stream.\n"
+                "It may be corrupt, truncated, or mislabelled. Try re-downloading it "
+                "or send the raw AAC/MP3 instead."
+            )
+            return
         if op == "add":
             await _run_job(msg, user_id, "add track", muxer.add_audio_track, video, audio)
         elif op == "replace":

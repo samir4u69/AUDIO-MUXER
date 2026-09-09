@@ -58,9 +58,10 @@ def main() -> None:
 
     _attach_file_log()
 
-    from bot.handlers import app, db  # noqa: WPS433 (imports register handlers)
+    from bot.handlers import app, db, set_loop  # noqa: WPS433
 
     async def _run() -> None:
+        set_loop(asyncio.get_running_loop())
         await app.start()
         mongo_ok = await db.ping()
         if mongo_ok:

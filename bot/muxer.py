@@ -49,7 +49,12 @@ class AudioMuxer:
         args = ["-i", str(video)]
         if audio_offset_ms < 0:
             args += ["-ss", str(abs(audio_offset_ms) / 1000.0)]
-        args += ["-i", str(audio), "-map", "0", "-map", "1:a"]
+        # Map only real media streams from the video: fonts/attachments (e.g.
+        # embedded TTF) make mp4/m4a muxers fail, and `-map 1:a` pulls every
+        # audio track from the audio input (covers multi-track mka/aac).
+        args += ["-i", str(audio),
+                 "-map", "0:v?", "-map", "0:a?", "-map", "0:s?",
+                 "-map", "1:a?"]
         if audio_offset_ms > 0:
             args += [f"-c:a:{new_idx}", "aac",
                      f"-filter:a:{new_idx}", f"adelay={audio_offset_ms}:all=1"]
