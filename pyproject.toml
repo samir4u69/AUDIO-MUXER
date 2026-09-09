@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audio-muxer"
+version = "1.0.0"
+description = "Audio muxing, auto-sync detection and trimming for video files — CLI + Telegram bot"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AudioMuxer Pro" }]
+keywords = ["ffmpeg", "audio", "muxing", "sync", "video", "telegram-bot"]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+telegram = ["python-telegram-bot>=20.0"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[project.scripts]
+audio-muxer = "audio_muxer.__main__:main"
+audio-muxer-bot = "audio_muxer.bot.telegram_bot:main"
+
+[tool.setuptools.packages.find]
+include = ["audio_muxer*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
