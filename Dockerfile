@@ -5,7 +5,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# tgcrypto ships no prebuilt wheel; build it, then drop the toolchain to
+# keep the image small.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc python3-dev \
+    && pip install --no-cache-dir -r requirements.txt \
+    && apt-get purge -y gcc python3-dev && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY bot ./bot
 
