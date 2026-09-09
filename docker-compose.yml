@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    volumes:
+      - bot-data:/data/audiomuxer
+    depends_on:
+      - mongo
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
+volumes:
+  bot-data:
+  mongo-data:
