@@ -12,8 +12,10 @@ files. Built on **Pyrogram** (MTProto), **MongoDB** (users/roles/jobs) and
   cross-correlation, confidence-scored, with manual offset fallback)
 - Trim by time range, remove silence
 - Convert formats, adjust volume, loudness-normalize
-- Inline-button menu with live progress bars
-- Owner / admin roles, ban/unban, broadcast, stats
+- Inline-button menu with **live progress UI** — download, processing and
+  upload each show an animated bar with %, transferred size, speed and ETA
+  (throttled to respect Telegram rate limits)
+- Owner / admin roles, ban/unban, broadcast, stats, `/logs` tail command
 - Job queue with bounded concurrency; automatic temp-file cleanup
 
 ## Setup
@@ -63,7 +65,16 @@ python -m bot
 
 3. Tap an action and follow the prompt (send the second file for
    add/replace/sync, or the parameters for trim/volume/convert).
-4. The result is sent back as a document with a live progress bar.
+4. Watch the live progress: download → processing → upload each show an
+   animated bar with percentage, transferred size, speed and ETA.
+
+```
+📥 Downloading
+[████████░░░░] 67%
+📦 134.0 MB / 200.0 MB
+⚡ 8.2 MB/s   ⏳ ETA 8s
+⏱ 16s elapsed
+```
 
 ### Commands
 
@@ -72,6 +83,7 @@ python -m bot
 | `/start`, `/help` | all | intro & command list |
 | `/myjobs` | all | your recent jobs |
 | `/stats` | admins | users/jobs/admins counts |
+| `/logs [lines]` | admins | tail of the bot log (default 100) |
 | `/broadcast <text>` | owner | message every user |
 | `/ban <id>` / `/unban <id>` | owner | ban management |
 | `/addadmin <id>` / `/deladmin <id>` | owner | role management |

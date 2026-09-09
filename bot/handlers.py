@@ -6,6 +6,7 @@ Run with:  python -m bot
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 import uuid
@@ -68,10 +69,92 @@ AUDIO_INPUT_OPS = {"add", "replace", "sync", "manual_sync"}
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Progress UI
 # ---------------------------------------------------------------------------
-def _bar(percent: int) -> str:
-    return "█" * (percent // 10) + "░" * (10 - percent // 10)
+def _bar(percent: float, width: int = 12) -> str:
+    filled = int(round(percent / 100 * width))
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _eta(seconds: float) -> str:
+    if seconds != seconds or seconds < 0 or seconds == float("inf"):  # NaN/inf
+        return "…"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
+class Progress:
+    """Throttle edits and render a detailed progress block.
+
+    Tracks bytes (transfer) or percent (processing), computing speed & ETA.
+    Edits the status message at most once per PROGRESS_UPDATE_INTERVAL.
+    """
+
+    def __init__(self, status: Message, label: str, total: int | None = None):
+        self.status = status
+        self.label = label
+        self.total = total or 0
+        self.started = time.monotonic()
+        self._last_edit = 0.0
+        self._pending: asyncio.Task | None = None
+
+    # -- transfer-style update (pyrogram download/upload callback) --
+    def update(self, current: int, total: int | None = None):
+        if total:
+            self.total = total
+        pct = (current / self.total * 100) if self.total else 0.0
+        self._maybe_edit(pct, current)
+
+    # -- percent-style update (ffmpeg on_progress callback) --
+    def update_percent(self, pct: float):
+        self._maybe_edit(float(pct), None)
+
+    def _maybe_edit(self, pct: float, current: int | None):
+        now = time.monotonic()
+        if pct < 100 and now - self._last_edit < config.PROGRESS_UPDATE_INTERVAL:
+            return
+        self._last_edit = now
+        text = self._render(pct, current)
+        if self._pending is None or self._pending.done():
+            self._pending = asyncio.ensure_future(self._safe_edit(text))
+
+    def _render(self, pct: float, current: int | None) -> str:
+        elapsed = max(time.monotonic() - self.started, 1e-3)
+        lines = [f"{self.label}", f"[{_bar(pct)}] {pct:.0f}%"]
+        if current is not None and self.total:
+            speed = current / elapsed
+            remaining = (self.total - current) / speed if speed > 0 else float("inf")
+            lines.append(f"📦 {_human(current)} / {_human(self.total)}")
+            lines.append(f"⚡ {_human(speed)}/s   ⏳ ETA {_eta(remaining)}")
+        lines.append(f"⏱ {_eta(elapsed)} elapsed")
+        return "\n".join(lines)
+
+    async def _safe_edit(self, text: str):
+        try:
+            await self.status.edit_text(text)
+        except Exception:
+            pass  # message deleted / not modified / flood — ignore
+
+    async def finish(self, text: str):
+        if self._pending is not None:
+            try:
+                await self._pending
+            except Exception:
+                pass
+        await self._safe_edit(text)
 
 
 async def _role(user_id: int) -> str:
@@ -93,6 +176,7 @@ async def _allowed(msg: Message) -> bool:
 
 
 def _owner_only(func):
+    @functools.wraps(func)
     async def wrapper(client, msg: Message):
         if msg.from_user.id != config.OWNER_ID:
             await msg.reply_text("⛔ Owner only.")
@@ -102,12 +186,32 @@ def _owner_only(func):
 
 
 def _admin_only(func):
+    @functools.wraps(func)
     async def wrapper(client, msg: Message):
         if not await _is_admin(msg.from_user.id):
             await msg.reply_text("⛔ Admins only.")
             return
         return await func(client, msg)
     return wrapper
+
+
+async def _send_result(msg: Message, path: Path, status: Message | None = None,
+                       caption: str | None = None) -> None:
+    """Send a file back with live upload progress."""
+    size = path.stat().st_size
+    if status is None:
+        status = await msg.reply_text("📤 Uploading…")
+    up = Progress(status, "📤 **Uploading**", total=size)
+    try:
+        await msg.reply_document(
+            str(path),
+            caption=caption or f"📄 `{path.name}` ({_human(size)})",
+            progress=up.update,
+        )
+        await up.finish(f"✅ Done — sent `{path.name}` ({_human(size)}).")
+    except Exception as exc:
+        await up.finish(f"❌ Upload failed: {exc}")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +244,7 @@ async def cmd_help(client, msg: Message):
         "Send any video/audio file to get the action menu.\n\n"
         "**Admin commands**\n"
         "/stats — bot statistics\n"
+        "/logs [lines] — recent bot logs\n"
         "/broadcast <text> — message all users (owner)\n"
         "/ban <user_id> / /unban <user_id> (owner)\n"
         "/addadmin <user_id> / /deladmin <user_id> (owner)"
@@ -174,6 +279,34 @@ async def cmd_stats(client, msg: Message):
         f"  done: {stats.get('done', 0)}  failed: {stats.get('failed', 0)}  "
         f"running: {stats.get('running', 0)}"
     )
+
+
+@app.on_message(filters.command("logs"))
+@_admin_only
+async def cmd_logs(client, msg: Message):
+    """Send recent log lines. Usage: /logs [lines]"""
+    try:
+        n = int(msg.command[1]) if len(msg.command) > 1 else 100
+    except ValueError:
+        n = 100
+    n = max(1, min(n, 4000))
+    path = config.LOG_FILE
+    if not path.exists() or path.stat().st_size == 0:
+        await msg.reply_text("No log file yet.")
+        return
+    try:
+        lines = path.read_text(errors="replace").splitlines()[-n:]
+    except OSError as exc:
+        await msg.reply_text(f"❌ Could not read logs: {exc}")
+        return
+    text = "\n".join(lines) or "(empty)"
+    if len(text) <= 4000:
+        await msg.reply_text(f"```\n{text}\n```")
+        return
+    tail = config.WORK_DIR / f"logs_tail_{n}.txt"
+    tail.write_text(text)
+    await _send_result(msg, tail, caption=f"📜 Last {len(lines)} log lines")
+    tail.unlink(missing_ok=True)
 
 
 @app.on_message(filters.command("addadmin"))
@@ -261,9 +394,16 @@ async def handle_media(client, msg: Message):
         await msg.reply_text(f"⚠️ File exceeds the {config.MAX_FILE_SIZE_MB} MB limit.")
         return
 
-    status = await msg.reply_text("📥 Downloading…")
+    status = await msg.reply_text("📥 Preparing download…")
     dest = config.WORK_DIR / f"{user_id}_{media.file_unique_id}{ext}"
-    await msg.download(file_name=str(dest))
+    dl = Progress(status, "📥 **Downloading**", total=media.file_size)
+    try:
+        await msg.download(file_name=str(dest), progress=dl.update)
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        await dl.finish(f"❌ Download failed: {exc}")
+        return
+    await dl.finish(f"📥 Download complete ({_human(dest.stat().st_size)}). Analyzing…")
 
     if pending in AUDIO_INPUT_OPS and state.get("file"):
         await _handle_audio_input(msg, status, user_id, state, dest)
@@ -313,8 +453,7 @@ async def _handle_audio_input(msg, status, user_id, state, audio: Path):
                 out = await muxer.add_audio_track(
                     video, audio, audio_offset_ms=-int(round(result.offset_ms))
                 )
-                await status.edit_text("✅ Sync corrected! Sending…")
-                await msg.reply_document(str(out))
+                await _send_result(msg, out, status)
         elif op == "manual_sync":
             state["sync_audio"] = str(audio)
             await db.set_session(user_id, state)
@@ -415,7 +554,7 @@ async def handle_text(client, msg: Message):
                 f"✅ Silence removed ({len(segs)} segments, "
                 f"saved {sum(s.duration for s in segs):.1f}s)"
             )
-            await msg.reply_document(str(out))
+            await _send_result(msg, out)
         elif op == "volume":
             gain = float(msg.text.strip().lstrip("+"))
             await _run_job(msg, user_id, "volume", muxer.adjust_volume, file, gain_db=gain)
@@ -436,23 +575,19 @@ async def handle_text(client, msg: Message):
 async def _run_job(msg, user_id: int, name: str, func, *args, **kwargs):
     job_id = uuid.uuid4().hex[:12]
     await db.create_job(job_id, user_id, name, [str(a) for a in args[:1]])
-    status = await msg.reply_text(f"🔄 {name} started…")
-    last = {"p": -10}
-
-    def progress(p: int):
-        if p - last["p"] >= 10 and p < 100:
-            last["p"] = p
-            asyncio.ensure_future(status.edit_text(f"🔄 {name}: [{_bar(p)}] {p}%"))
+    status = await msg.reply_text(f"🔄 {name}: queued…")
+    prog = Progress(status, f"⚙️ **{name}**")
 
     async with _queue_sem:
         await db.update_job(job_id, status="running")
         try:
-            out = await func(*args, on_progress=progress, **kwargs)
+            out = await func(*args, on_progress=prog.update_percent, **kwargs)
             await db.update_job(job_id, status="done", progress=100,
                                 result=str(out) if isinstance(out, Path) else None)
-            await status.edit_text(f"✅ {name} finished! Sending…")
             if isinstance(out, Path):
-                await msg.reply_document(str(out))
+                await _send_result(msg, out, status)
+            else:
+                await prog.finish(f"✅ {name} finished!")
         except Exception as exc:
             await db.update_job(job_id, status="failed", error=str(exc))
-            await status.edit_text(f"❌ {name} failed: {exc}")
+            await prog.finish(f"❌ {name} failed: {exc}")

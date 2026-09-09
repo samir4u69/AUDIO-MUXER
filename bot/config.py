@@ -54,6 +54,13 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Logging -----------------------------------------------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+LOG_FILE = Path(os.environ.get("LOG_FILE", WORK_DIR / "audiomuxer.log"))
+
+_PROGRESS_ENV = os.environ.get("PROGRESS_UPDATE_INTERVAL", "1.5")
+try:
+    PROGRESS_UPDATE_INTERVAL = max(0.5, float(_PROGRESS_ENV))
+except ValueError:
+    PROGRESS_UPDATE_INTERVAL = 1.5
 
 # ---------------------------------------------------------------------------
 VIDEO_EXTENSIONS = {

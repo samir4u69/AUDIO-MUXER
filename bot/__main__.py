@@ -12,8 +12,20 @@ from bot.ffmpeg_wrapper import check_ffmpeg
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger("audiomuxer")
+
+
+def _attach_file_log() -> None:
+    """Also write logs to a file so /logs can send them."""
+    try:
+        config.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(config.LOG_FILE)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(fh)
+    except OSError as exc:
+        log.warning("File logging disabled: %s", exc)
 
 
 async def _janitor() -> None:
@@ -43,6 +55,8 @@ def main() -> None:
     ok, msg = check_ffmpeg()
     if not ok:
         raise SystemExit(f"ffmpeg check failed: {msg}")
+
+    _attach_file_log()
 
     from bot.handlers import app, db  # noqa: WPS433 (imports register handlers)
 
