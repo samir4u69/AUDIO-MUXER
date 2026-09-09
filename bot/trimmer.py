@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +15,19 @@ log = logging.getLogger(__name__)
 
 _SIL_START = re.compile(r"silence_start: ([\d.]+)")
 _SIL_END = re.compile(r"silence_end: ([\d.]+)")
+
+
+def _clean_out(out_dir: Path, stem: str, ext: str) -> Path:
+    """Output path with a clean name; append _2, _3… only on collision."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    candidate = out_dir / f"{stem}{ext}"
+    if not candidate.exists():
+        return candidate
+    for i in range(2, 1000):
+        candidate = out_dir / f"{stem}_{i}{ext}"
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"No free output name for {stem}{ext}")
 
 
 @dataclass
@@ -49,7 +61,7 @@ def parse_timestamp(ts: str) -> float:
 
 class Trimmer:
     def __init__(self, work_dir: Path | None = None):
-        self.work_dir = work_dir or config.WORK_DIR
+        self.work_dir = work_dir or config.OUTPUT_DIR
 
     async def trim(self, media, start=None, end=None, duration=None,
                    reencode=False, on_progress=None) -> Path:
@@ -73,8 +85,7 @@ class Trimmer:
         if dur is not None and is_video:
             reencode = True
 
-        out = self.work_dir / f"{media.stem}_trim_{uuid.uuid4().hex[:8]}{media.suffix}"
-        self.work_dir.mkdir(parents=True, exist_ok=True)
+        out = _clean_out(self.work_dir, f"{media.stem}_trim", media.suffix)
         args = []
         if not reencode:
             args += ["-ss", f"{start_s:.3f}"]
@@ -133,7 +144,7 @@ class Trimmer:
             return out, silences
 
         is_video = media.suffix.lower() in config.VIDEO_EXTENSIONS
-        out = self.work_dir / f"{media.stem}_nosil_{uuid.uuid4().hex[:8]}{media.suffix}"
+        out = _clean_out(self.work_dir, f"{media.stem}_nosil", media.suffix)
         filters, pairs = [], []
         for i, (s, e) in enumerate(keep):
             if is_video:

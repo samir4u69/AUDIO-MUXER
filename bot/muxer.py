@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import uuid
 from pathlib import Path
 
 from bot import config
@@ -14,13 +13,25 @@ log = logging.getLogger(__name__)
 
 
 def _out(out_dir: Path, stem: str, ext: str) -> Path:
+    """Output path named after the input (no random suffix).
+
+    Only appends _2, _3, … when a different file with that exact name already
+    exists, so the common case keeps the original filename.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir / f"{stem}_{uuid.uuid4().hex[:8]}{ext}"
+    candidate = out_dir / f"{stem}{ext}"
+    if not candidate.exists():
+        return candidate
+    for i in range(2, 1000):
+        candidate = out_dir / f"{stem}_{i}{ext}"
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"Could not find a free output name for {stem}{ext}")
 
 
 class AudioMuxer:
     def __init__(self, work_dir: Path | None = None):
-        self.work_dir = work_dir or config.WORK_DIR
+        self.work_dir = work_dir or config.OUTPUT_DIR
 
     async def extract_audio(self, video, out_format="mp3", audio_track=0,
                             bitrate="192k", on_progress=None) -> Path:
@@ -44,6 +55,8 @@ class AudioMuxer:
 
         from bot.media_info import inspect
         info = await inspect(video)
+        # Existing audio tracks occupy output audio indexes 0..N-1; the newly
+        # added external track(s) follow starting at index N.
         new_idx = len(info.audio_tracks)
 
         args = ["-i", str(video)]
@@ -56,9 +69,13 @@ class AudioMuxer:
                  "-map", "0:v?", "-map", "0:a?", "-map", "0:s?",
                  "-map", "1:a?"]
         if audio_offset_ms > 0:
-            args += [f"-c:a:{new_idx}", "aac",
-                     f"-filter:a:{new_idx}", f"adelay={audio_offset_ms}:all=1"]
-        args += ["-c", "copy", "-map_metadata", "0"]
+            # Delaying the new track needs a filter, so re-encode audio; video
+            # and subtitles still stream-copy.
+            args += ["-filter:a", f"adelay={audio_offset_ms}:all=1",
+                     "-c:v", "copy", "-c:s", "copy", "-c:a", "aac"]
+        else:
+            args += ["-c", "copy"]
+        args += ["-map_metadata", "0"]
         if language:
             code = config.LANGUAGE_CODES.get(language.lower(), language[:3].lower())
             args += [f"-metadata:s:a:{new_idx}", f"language={code}"]

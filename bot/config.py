@@ -51,6 +51,9 @@ TEMP_TTL_SECONDS = _int("TEMP_TTL_SECONDS", 24 * 3600)
 # --- Paths -------------------------------------------------------------------
 WORK_DIR = Path(os.environ.get("WORK_DIR", "/tmp/audiomuxer"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+# Where processed files are written (downloaded inputs stay in WORK_DIR).
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", WORK_DIR / "outputs"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Logging -----------------------------------------------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")

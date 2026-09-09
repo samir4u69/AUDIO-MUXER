@@ -80,6 +80,23 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
      InlineKeyboardButton("🔁 Convert", callback_data="op:convert")],
 ])
 
+# After the user sends the audio for "Add", choose how to align it.
+ADD_SYNC_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔍 Auto Sync", callback_data="addsync:auto"),
+     InlineKeyboardButton("➕ Just Add (no sync)", callback_data="addsync:none")],
+])
+
+# Language picker for the added track.
+def _language_keyboard() -> InlineKeyboardMarkup:
+    langs = ["English", "Hindi", "Japanese", "Spanish", "French", "German",
+             "Korean", "Chinese", "Arabic", "Russian", "Tamil", "Telugu"]
+    rows = [[InlineKeyboardButton(l, callback_data=f"lang:{l.lower()}")
+             for l in langs[i:i + 3]] for i in range(0, len(langs), 3)]
+    rows.append([InlineKeyboardButton("🚫 No language tag", callback_data="lang:none")])
+    return InlineKeyboardMarkup(rows)
+
+LANGUAGE_KEYBOARD = _language_keyboard()
+
 PARAM_PROMPTS = {
     "extract": "Which audio format? Reply with mp3, aac, wav, flac, ogg or opus.",
     "trim": "Send start and end times, e.g. `00:10:00 00:20:00`",
@@ -452,7 +469,7 @@ async def handle_media(client, msg: Message):
         return
     await dl.finish(f"📥 Download complete ({_human(dest.stat().st_size)}). Analyzing…")
 
-    if pending in AUDIO_INPUT_OPS and state.get("file"):
+    if pending in AUDIO_INPUT_OPS and state.get("file") and dest != Path(state["file"]):
         await _handle_audio_input(msg, status, user_id, state, dest)
         return
 
@@ -467,7 +484,8 @@ async def handle_media(client, msg: Message):
         await status.edit_text("⚠️ File exceeds the duration limit.")
         return
 
-    state.update({"file": str(dest), "kind": "video" if info.is_video else "audio"})
+    state.update({"file": str(dest), "file_name": file_name,
+                  "kind": "video" if info.is_video else "audio"})
     state.pop("pending_op", None)
     await db.set_session(user_id, state)
     await status.edit_text(
@@ -492,8 +510,16 @@ async def _handle_audio_input(msg, status, user_id, state, audio: Path):
             )
             return
         if op == "add":
-            await _run_job(msg, user_id, "add track", muxer.add_audio_track, video, audio)
-        elif op == "replace":
+            # Stash the audio and ask how to align it (auto-sync or none),
+            # then pick a language. The actual mux happens in the callbacks.
+            state["pending_audio"] = str(audio)
+            await db.set_session(user_id, state)
+            await status.edit_text(
+                "🎵 Got the audio. How should I align it with the video?",
+                reply_markup=ADD_SYNC_KEYBOARD,
+            )
+            return
+        if op == "replace":
             await _run_job(msg, user_id, "replace track", muxer.replace_audio, video, audio)
         elif op == "sync":
             await status.edit_text("🔍 Analyzing audio sync…")
@@ -529,6 +555,21 @@ async def _handle_audio_input(msg, status, user_id, state, audio: Path):
             await db.set_session(user_id, state)
 
 
+async def _do_add(query, user_id, state, language: str | None,
+                  auto_sync: bool, offset_ms: int = 0):
+    """Run the add-track job with the chosen language and sync offset."""
+    video = state["file"]
+    audio = state.get("pending_audio")
+    if not audio:
+        await query.message.edit_text("⚠️ Audio file missing — send it again.")
+        return
+    kwargs = {"audio_offset_ms": offset_ms}
+    if language:
+        kwargs["language"] = language
+    await _run_job(query.message, user_id, "add track",
+                   muxer.add_audio_track, video, audio, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Buttons
 # ---------------------------------------------------------------------------
@@ -536,7 +577,52 @@ async def _handle_audio_input(msg, status, user_id, state, audio: Path):
 async def on_button(client, query: CallbackQuery):
     user_id = query.from_user.id
     state = await db.get_session(user_id)
-    action = query.data.split(":", 1)[1]
+    data = query.data
+
+    # --- Add-audio flow: alignment choice, then language, then run ---
+    if data.startswith("addsync:"):
+        if not state.get("file") or not state.get("pending_audio"):
+            await query.answer("Session expired — start over.", show_alert=True)
+            return
+        state["add_auto_sync"] = data == "addsync:auto"
+        await db.set_session(user_id, state)
+        await query.message.edit_text(
+            "🌐 Pick a language for the new audio track:",
+            reply_markup=LANGUAGE_KEYBOARD,
+        )
+        await query.answer()
+        return
+
+    if data.startswith("lang:"):
+        if not state.get("file") or not state.get("pending_audio"):
+            await query.answer("Session expired — start over.", show_alert=True)
+            return
+        language = None if data == "lang:none" else data.split(":", 1)[1]
+        auto_sync = state.pop("add_auto_sync", False)
+        video = state["file"]
+        audio = state.pop("pending_audio")
+        state.pop("pending_op", None)
+        await db.set_session(user_id, state)
+        await query.answer()
+
+        offset_ms = 0
+        if auto_sync:
+            await query.message.edit_text("🔍 Analyzing audio sync…")
+            try:
+                result = await detector.detect(video, audio)
+            except SyncDetectionError as exc:
+                await query.message.edit_text(f"⚠️ Sync detection failed: {exc}. Adding without offset.")
+                result = None
+            if result is not None:
+                if result.reliable and abs(result.offset_ms) >= 1:
+                    offset_ms = -int(round(result.offset_ms))
+                    await query.message.edit_text(f"🔍 {result.summary()}\nApplying and adding track…")
+                else:
+                    await query.message.edit_text("✅ Audio already aligned. Adding track…")
+        await _do_add(query, user_id, state, language, auto_sync, offset_ms)
+        return
+
+    action = data.split(":", 1)[1] if ":" in data else data
 
     if action == "info":
         file = state.get("file")
@@ -560,7 +646,7 @@ async def on_button(client, query: CallbackQuery):
         await query.message.edit_text(PARAM_PROMPTS[action])
     elif action in AUDIO_INPUT_OPS:
         note = {
-            "add": "as the new track",
+            "add": "as the new track (you'll pick sync & language next)",
             "replace": "as the replacement",
             "sync": "for auto-sync detection",
             "manual_sync": "you'll set the offset after sending it",
@@ -623,6 +709,8 @@ async def handle_text(client, msg: Message):
     finally:
         state.pop("pending_op", None)
         state.pop("sync_audio", None)
+        state.pop("pending_audio", None)
+        state.pop("add_auto_sync", None)
         await db.set_session(user_id, state)
 
 
