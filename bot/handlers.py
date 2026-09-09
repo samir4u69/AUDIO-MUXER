@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -44,28 +45,6 @@ app = Client(
     bot_token=config.BOT_TOKEN,
     in_memory=True,
 )
-
-# The asyncio loop the bot runs on. Captured lazily on first use so that the
-# pyrogram progress callbacks (which run in executor threads) can schedule
-# message edits back onto it via run_coroutine_threadsafe.
-_LOOP: asyncio.AbstractEventLoop | None = None
-
-
-def set_loop(loop: asyncio.AbstractEventLoop) -> None:
-    """Record the bot's running loop (called once at startup)."""
-    global _LOOP
-    _LOOP = loop
-
-
-def _loop() -> asyncio.AbstractEventLoop:
-    global _LOOP
-    try:
-        _LOOP = asyncio.get_running_loop()
-    except RuntimeError:
-        pass
-    if _LOOP is None:
-        _LOOP = app.loop
-    return _LOOP
 
 MAIN_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎵 Extract Audio", callback_data="op:extract"),
@@ -136,63 +115,61 @@ def _eta(seconds: float) -> str:
 
 
 class Progress:
-    """Throttle edits and render a detailed progress block.
+    """Detailed progress UI: animated bar, %, size, speed and ETA.
 
-    Tracks bytes (transfer) or percent (processing), computing speed & ETA.
-    Edits the status message at most once per PROGRESS_UPDATE_INTERVAL.
+    Two styles of update feed it:
+      * ``update(current, total)`` — called by pyrogram from a *worker thread*
+        on every chunk. This must stay non-blocking, so it only records the
+        latest values; a poller task on the bot loop renders the edits.
+      * ``update_percent(pct)`` — called by ffmpeg on the bot loop.
     """
 
     def __init__(self, status: Message, label: str, total: int | None = None):
         self.status = status
         self.label = label
         self.total = total or 0
+        self.current = 0
+        self.percent = 0.0
         self.started = time.monotonic()
-        self._last_edit = 0.0
-        self._last_text = ""
-        self._pending = None  # asyncio.Task or concurrent Future
         self._editable = hasattr(status, "edit_text")
+        self._lock = threading.Lock()
+        self._poller: asyncio.Task | None = None
 
-    # -- transfer-style update (pyrogram download/upload callback).
-    # NOTE: pyrogram invokes this from an executor thread, so all edits must
-    # be scheduled thread-safely onto the bot's event loop.
+    # -- transfer-style update (pyrogram download/upload callback, worker thread) --
     def update(self, current: int, total: int | None = None):
-        if total:
-            self.total = total
-        pct = (current / self.total * 100) if self.total else 0.0
-        self._schedule(pct, current)
+        with self._lock:
+            if total:
+                self.total = total
+            self.current = current
+            if self.total:
+                self.percent = current / self.total * 100
 
     # -- percent-style update (ffmpeg on_progress callback, runs on the loop) --
     def update_percent(self, pct: float):
-        self._schedule(float(pct), None)
+        with self._lock:
+            self.percent = float(pct)
 
-    def _schedule(self, pct: float, current: int | None):
+    async def run(self):
+        """Poll progress and edit the status message. Start for transfers."""
         if not self._editable:
             return
-        now = time.monotonic()
-        if pct < 100 and now - self._last_edit < config.PROGRESS_UPDATE_INTERVAL:
-            return
-        self._last_edit = now
-        text = self._render(pct, current)
-        if text == self._last_text:
-            return
-        self._last_text = text
-        if self._pending is not None and not self._pending.done():
-            return  # an edit is already in flight; skip to avoid flooding
-        coro = self._safe_edit(text)
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is not None and running is _loop():
-            self._pending = running.create_task(coro)
-        else:
-            # Called from a worker thread: hop to the bot loop.
-            self._pending = asyncio.run_coroutine_threadsafe(coro, _loop())
+        self._poller = asyncio.current_task()
+        last_text = ""
+        while True:
+            with self._lock:
+                pct, cur, tot = self.percent, self.current, self.total
+            text = self._render(pct, cur)
+            if text != last_text:
+                last_text = text
+                await self._safe_edit(text)
+            if pct >= 100:
+                break
+            await asyncio.sleep(config.PROGRESS_UPDATE_INTERVAL)
 
     def _render(self, pct: float, current: int | None) -> str:
         elapsed = max(time.monotonic() - self.started, 1e-3)
         lines = [f"{self.label}", f"[{_bar(pct)}] {pct:.0f}%"]
-        if current is not None and self.total:
+        if current and self.total:
             speed = current / elapsed
             remaining = (self.total - current) / speed if speed > 0 else float("inf")
             lines.append(f"📦 {_human(current)} / {_human(self.total)}")
@@ -207,16 +184,13 @@ class Progress:
             pass  # message deleted / not modified / flood — ignore
 
     async def finish(self, text: str):
-        self._last_text = ""  # force the final edit through
-        pending, self._pending = self._pending, None
-        if pending is not None:
+        if self._poller is not None:
+            self._poller.cancel()
             try:
-                if isinstance(pending, asyncio.Future):
-                    await pending
-                else:  # concurrent.futures.Future
-                    await asyncio.wrap_future(pending)
-            except Exception:
+                await self._poller
+            except asyncio.CancelledError:
                 pass
+            self._poller = None
         if self._editable:
             await self._safe_edit(text)
 
@@ -266,14 +240,17 @@ async def _send_result(msg: Message, path: Path, status: Message | None = None,
     if status is None:
         status = await msg.reply_text("📤 Uploading…")
     up = Progress(status, "📤 **Uploading**", total=size)
+    poller = asyncio.ensure_future(up.run())
     try:
         await msg.reply_document(
             str(path),
             caption=caption or f"📄 `{path.name}` ({_human(size)})",
             progress=up.update,
         )
+        poller.cancel()
         await up.finish(f"✅ Done — sent `{path.name}` ({_human(size)}).")
     except Exception as exc:
+        poller.cancel()
         await up.finish(f"❌ Upload failed: {exc}")
         raise
 
@@ -461,12 +438,15 @@ async def handle_media(client, msg: Message):
     status = await msg.reply_text("📥 Preparing download…")
     dest = config.WORK_DIR / f"{user_id}_{media.file_unique_id}{ext}"
     dl = Progress(status, "📥 **Downloading**", total=media.file_size)
+    poller = asyncio.ensure_future(dl.run())
     try:
         await msg.download(file_name=str(dest), progress=dl.update)
     except Exception as exc:
+        poller.cancel()
         dest.unlink(missing_ok=True)
         await dl.finish(f"❌ Download failed: {exc}")
         return
+    poller.cancel()
     await dl.finish(f"📥 Download complete ({_human(dest.stat().st_size)}). Analyzing…")
 
     if pending in AUDIO_INPUT_OPS and state.get("file") and dest != Path(state["file"]):
@@ -725,8 +705,10 @@ async def _run_job(msg, user_id: int, name: str, func, *args, **kwargs):
 
     async with _queue_sem:
         await db.update_job(job_id, status="running")
+        poller = asyncio.ensure_future(prog.run())
         try:
             out = await func(*args, on_progress=prog.update_percent, **kwargs)
+            poller.cancel()
             await db.update_job(job_id, status="done", progress=100,
                                 result=str(out) if isinstance(out, Path) else None)
             if isinstance(out, Path):
@@ -734,5 +716,6 @@ async def _run_job(msg, user_id: int, name: str, func, *args, **kwargs):
             else:
                 await prog.finish(f"✅ {name} finished!")
         except Exception as exc:
+            poller.cancel()
             await db.update_job(job_id, status="failed", error=str(exc))
             await prog.finish(f"❌ {name} failed: {exc}")

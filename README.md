@@ -37,9 +37,40 @@ cp .env.example .env
 
 ```bash
 docker compose up -d --build
+docker compose logs -f bot      # follow the logs
+docker compose down             # stop
 ```
 
 This starts the bot **and** a MongoDB container, with persistent volumes.
+Set `MONGO_URI=mongodb://mongo:27017` in `.env` (the compose service name).
+
+### Run with plain Docker
+
+Build the image and run it. With plain `docker run` there is **no MongoDB**,
+so the bot runs without persistence (users/jobs are kept in memory only):
+
+```bash
+docker build -t audiomuxer .
+docker run -d --name audiomuxer --env-file .env \
+  -v audiomuxer_data:/data/audiomuxer \
+  --restart unless-stopped \
+  audiomuxer
+docker logs -f audiomuxer       # follow the logs
+docker stop audiomuxer          # stop
+```
+
+To run it together with a MongoDB container without compose:
+
+```bash
+docker network create audiomuxer_net
+docker run -d --name mongo --network audiomuxer_net \
+  -v mongo_data:/data/db mongo:7
+docker run -d --name audiomuxer --network audiomuxer_net --env-file .env \
+  -e MONGO_URI=mongodb://mongo:27017 \
+  -v audiomuxer_data:/data/audiomuxer \
+  --restart unless-stopped \
+  audiomuxer
+```
 
 ### Run locally
 
