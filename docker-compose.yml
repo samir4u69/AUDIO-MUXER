@@ -2,8 +2,12 @@ services:
   bot:
     build: .
     env_file: .env
+    environment:
+      # Lets /update git-pull the mounted repo inside the container.
+      GIT_REPO_DIR: /repo
     volumes:
       - bot-data:/data/audiomuxer
+      - .:/repo          # mount this repo so /update can pull new code
     depends_on:
       - mongo
     restart: unless-stopped

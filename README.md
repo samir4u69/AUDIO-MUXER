@@ -115,6 +115,8 @@ python -m bot
 | `/myjobs` | all | your recent jobs |
 | `/stats` | admins | users/jobs/admins counts |
 | `/logs [lines]` | admins | tail of the bot log (default 100) |
+| `/update` | owner | `git pull` the repo to sync the latest code |
+| `/restart` | owner | restart the bot process to load new code |
 | `/broadcast <text>` | owner | message every user |
 | `/ban <id>` / `/unban <id>` | owner | ban management |
 | `/addadmin <id>` / `/deladmin <id>` | owner | role management |
@@ -123,6 +125,24 @@ python -m bot
 
 See `.env.example` for the full list. Required: `API_ID`, `API_HASH`,
 `BOT_TOKEN`, `OWNER_ID`, `MONGO_URI`.
+
+### Self-update (`/update`)
+
+The bot can pull its own latest code with `/update` and reload with `/restart`.
+For that to work inside Docker, the repo must be reachable in the container and
+the image must include `git` (the provided Dockerfile already installs it).
+Compose mounts the repo at `/repo` and sets `GIT_REPO_DIR=/repo` automatically.
+With plain `docker run`, add:
+
+```bash
+-v /path/to/AUDIO-MUXER:/repo -e GIT_REPO_DIR=/repo
+```
+
+`/update` runs `git pull --ff-only` and, if the branch has diverged, force-syncs
+to the upstream. Because the process runs the code baked into the image, send
+`/restart` after an update to load the new code (Docker restarts it
+automatically via `restart: unless-stopped`). Note: dependency changes still
+need a rebuild (`docker compose up -d --build`).
 
 ## How sync detection works
 

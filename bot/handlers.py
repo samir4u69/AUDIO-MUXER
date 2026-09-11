@@ -299,6 +299,8 @@ async def cmd_help(client, msg: Message):
         "/stats — bot statistics\n"
         "/logs [lines] — recent bot logs\n"
         "/broadcast <text> — message all users (owner)\n"
+        "/update — git pull the repo (owner)\n"
+        "/restart — restart the bot to load new code (owner)\n"
         "/ban <user_id> / /unban <user_id> (owner)\n"
         "/addadmin <user_id> / /deladmin <user_id> (owner)"
     )
@@ -383,6 +385,76 @@ async def cmd_logs(client, msg: Message):
     tail.write_text(text)
     await _send_result(msg, tail, status=None, caption=f"📜 Last {len(lines)} log lines")
     tail.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Self-update
+# ---------------------------------------------------------------------------
+def _repo_dir() -> Path | None:
+    """Locate the git checkout containing the bot code."""
+    if config.GIT_REPO_DIR:
+        p = Path(config.GIT_REPO_DIR)
+        return p if (p / ".git").exists() else None
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+async def _git(repo: Path, *args) -> tuple[int, str]:
+    """Run a git command; return (returncode, combined output)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(repo), *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+    except FileNotFoundError:
+        return 127, "git is not installed"
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode("utf-8", "replace").strip()
+
+
+@app.on_message(filters.command("update"))
+@_owner_only
+async def cmd_update(client, msg: Message):
+    """git pull the repo so the bot syncs with the latest code."""
+    repo = _repo_dir()
+    if repo is None:
+        await msg.reply_text(
+            "❌ No git repository found.\n"
+            "Mount the repo into the container and set `GIT_REPO_DIR` in .env, "
+            "e.g. `-v ~/AUDIO-MUXER:/repo -e GIT_REPO_DIR=/repo`."
+        )
+        return
+    status = await msg.reply_text(f"⬇️ Pulling latest code in `{repo}`…")
+    rc, out = await _git(repo, "pull", "--ff-only")
+    if rc != 0 and "not possible to fast-forward" in out:
+        # Local commits/divergence: reset to the upstream of the current branch.
+        rc2, out2 = await _git(repo, "fetch", "origin")
+        rc3, out3 = await _git(repo, "reset", "--hard", "@{upstream}")
+        out = f"{out}\n\n--- force sync ---\n{out2}\n{out3}"
+        rc = rc3
+    if rc != 0:
+        await status.edit_text(f"❌ Update failed:\n```\n{out[-3500:]}\n```")
+        return
+    changed = "Already up to date" not in out and "up to date" not in out.lower()
+    tail = out[-3000:]
+    note = ("\n\n🔄 Changes applied. Send /restart to load the new code."
+            if changed else "\n\n✅ Already up to date.")
+    await status.edit_text(f"```\n{tail}\n```{note}")
+
+
+@app.on_message(filters.command("restart"))
+@_owner_only
+async def cmd_restart(client, msg: Message):
+    """Restart the bot process to load updated code."""
+    await msg.reply_text("🔄 Restarting… (bot will be back in a few seconds)")
+    log.warning("Restart requested by %s", msg.from_user.id)
+    import os as _os
+    await asyncio.sleep(0.5)
+    _os._exit(0)  # supervisor (docker --restart / compose) brings it back up
+
 
 
 @app.on_message(filters.command("addadmin"))
